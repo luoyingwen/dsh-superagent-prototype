@@ -863,6 +863,186 @@ describe('github source', () => {
     expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
     h.store.close()
   })
+  describe('delayed notification comments', () => {
+    const baseline = '2026-09-09T00:00:00.000Z'
+    const watermark = '2026-09-09T00:00:40.000Z'
+    const commentAt = '2026-09-09T00:00:35.000Z'
+    const hint = 'https://api.github.com/repos/acme/widgets/issues/comments/5'
+    function delayed(cursor?: string) {
+      const h = host()
+      h.store.set(KV.github.started, baseline)
+      h.store.set(KV.github.since, watermark)
+      if (cursor) h.store.set(KV.github.cursor(12), cursor)
+      const comment: GithubComment = { id: 5, body: '@agent-bot take this', user: { login: 'alice', type: 'User' },
+        html_url: 'https://github.com/acme/widgets/issues/12#issuecomment-5', created_at: commentAt, updated_at: commentAt }
+      const notified = { ...notification(12), updated_at: '2026-09-09T00:00:57Z',
+        subject: { ...notification(12).subject, latest_comment_url: hint as string | null } }
+      const routes: Record<string, unknown> = { notifications: [notified],
+        'issues/12': issue(12, { created_at: '2026-09-09T00:00:10Z', body: '@agent-bot later edited body' }),
+        'issues/comments/5': comment, 'issues/12/comments': [comment] }
+      const reads = github(h, routes)
+      // Honor the HTTP since filter too: fixing only the local timestamp check would not recover the request.
+      const run = vi.mocked(h.commands.run).getMockImplementation()!
+      vi.mocked(h.commands.run).mockImplementation(async (...args) => {
+        const output = await run(...args)
+        const address = new URL(args[1][1]!, 'https://api.github.com/')
+        const since = address.searchParams.get('since')
+        if (address.pathname.endsWith('/issues/12/comments') && since) {
+          const pages = JSON.parse(output) as GithubComment[][]
+          return JSON.stringify(pages.map(page => page.filter(item => Date.parse(item.updated_at ?? item.created_at ?? '') >= Date.parse(since))))
+        }
+        return output
+      })
+      return { h, comment, notified, routes, reads }
+    }
+    it.each([undefined, '2026-09-09T00:01:37.000Z'])('recovers a late mention behind both watermarks, once, with thread cursor %s', async cursor => {
+      const { h, comment, reads } = delayed(cursor)
+      await pollRound(h)
+      await pollRound(h)
+      const expected = commentTrigger(comment, { number: 12, isPr: false }, 'conversation', 'agent-bot')
+      expect(h.store.read.threadTriggers('github:12', 10).map(trigger => trigger.id)).toEqual([expected.id])
+      expect(h.engine.candidate(expected.id)?.strength).toBe('explicit')
+      expect(h.store.threads.get('github:12')?.evaluating?.triggerIds).toEqual([expected.id])
+      expect(h.receive.mock.calls.every(([trigger]) => trigger.meta.kind === 'conversation')).toBe(true)
+      expect(reads).toContain(`issues/12/comments?per_page=100&since=${encodeURIComponent('2026-09-09T00:00:30.000Z')}`)
+      h.store.close()
+    })
+    it('keeps an older thread cursor instead of skipping all but the latest comment', async () => {
+      const { h, comment, notified, routes } = delayed('2026-09-09T00:00:10.000Z')
+      notified.subject.latest_comment_url = null
+      routes['issues/12/comments'] = [{ ...comment, id: 4, created_at: '2026-09-09T00:00:20Z', updated_at: '2026-09-09T00:00:20Z' }, comment]
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([4, 5])
+      h.store.close()
+    })
+    it('does not import a pre-startup hint or treat an old edited body as a new request', async () => {
+      const { h } = delayed()
+      h.store.delete(KV.github.started)
+      await pollRound(h)
+      expect(h.store.get(KV.github.started)).toBe(watermark)
+      expect(h.receive).not.toHaveBeenCalled()
+      expect(h.store.tickets.open()).toEqual([])
+      h.store.close()
+    })
+    it.each(['hint', 'conversation'])('retries a failed %s read with the original hint and recovered boundary', async failedRead => {
+      const { h, comment, routes } = delayed('2026-09-09T00:01:37.000Z')
+      const path = failedRead === 'hint' ? 'issues/comments/5' : 'issues/12/comments'
+      routes[path] = refused(502, 'Bad Gateway')
+      await expect(pollRound(h)).rejects.toThrow('#12')
+      expect(h.store.get(KV.github.retries)?.[12]).toMatchObject({
+        since: failedRead === 'hint' ? '2026-09-09T00:01:37.000Z' : '2026-09-09T00:00:30.000Z' })
+      if (failedRead === 'hint') expect(h.store.get(KV.github.retries)?.[12]?.latestComments).toEqual(['issues/comments/5'])
+      else expect(h.store.get(KV.github.retries)?.[12]).not.toHaveProperty('latestComments')
+      routes.notifications = []
+      routes[path] = failedRead === 'hint' ? comment : [comment]
+      if (failedRead === 'conversation') routes['issues/comments/5'] = refused(502, 'No longer available')
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([5])
+      expect(h.store.get(KV.github.retries)).toEqual({})
+      h.store.close()
+    })
+    it('merges a new comment hint into a pending retry rather than discarding it', async () => {
+      const { h, comment, notified, routes } = delayed('2026-09-09T00:01:37.000Z')
+      routes['issues/comments/5'] = refused(502, 'Bad Gateway')
+      await expect(pollRound(h)).rejects.toThrow('#12')
+      const earlier = { ...comment, id: 6, updated_at: '2026-09-09T00:00:20Z' }
+      notified.subject.latest_comment_url = hint.replace('/5', '/6')
+      routes['issues/comments/5'] = comment
+      routes['issues/comments/6'] = earlier
+      routes['issues/12/comments'] = [earlier, comment]
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([6, 5])
+      h.store.close()
+    })
+    it.each(['https://example.com/issues/comments/5', 'https://api.github.com/repos/other/repo/issues/comments/5',
+      'https://api.github.com/repos/acme/widgets/pulls/99/reviews/5', 'http://api.github.com/repos/acme/widgets/issues/comments/5'])('ignores an unsafe or unrelated hint %s', async url => {
+      const { h, notified, reads } = delayed()
+      notified.subject.latest_comment_url = url
+      await pollRound(h)
+      expect(bare(reads)).not.toContain('issues/comments/5')
+      expect(h.receive).not.toHaveBeenCalled()
+      h.store.close()
+    })
+    it('ignores a same-repository hint whose response belongs to a different thread', async () => {
+      const { h, comment, routes } = delayed()
+      routes['issues/comments/5'] = { ...comment, html_url: 'https://github.com/acme/widgets/issues/99#issuecomment-5' }
+      await pollRound(h)
+      expect(h.receive).not.toHaveBeenCalled()
+      h.store.close()
+    })
+    it.each(['mallory', 'agent-bot'])('does not grant new authority to a recovered comment by %s', async login => {
+      const { h, comment } = delayed()
+      comment.user.login = login
+      await pollRound(h)
+      const id = commentTrigger(comment, { number: 12, isPr: false }, 'conversation', 'agent-bot').id
+      expect(h.engine.candidate(id)).toBeUndefined()
+      expect(h.store.tickets.open()).toEqual([])
+      if (login === 'agent-bot') expect(h.receive).not.toHaveBeenCalled()
+      h.store.close()
+    })
+    it.each([{ pr: false, hint: false }, { pr: false, hint: true }, { pr: true, hint: false }, { pr: true, hint: true }])('preserves the old body boundary with a newer thread cursor: %j', async options => {
+      const { h, comment, notified, routes } = delayed('2026-09-09T00:01:37.000Z')
+      comment.created_at = comment.updated_at = '2026-09-09T00:01:10Z'
+      if (!options.hint) notified.subject.latest_comment_url = null
+      if (options.pr) {
+        notified.subject.url = 'https://api.github.com/repos/acme/widgets/pulls/12'
+        comment.html_url = 'https://github.com/acme/widgets/pull/12#issuecomment-5'
+        routes['pulls/12'] = { ...openPull(12), created_at: '2026-09-09T00:01:00Z', body: '@agent-bot later edited body' }
+      } else routes['issues/12'] = issue(12, { created_at: '2026-09-09T00:01:00Z', body: '@agent-bot later edited body' })
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.kind)).toEqual(options.hint ? ['conversation'] : [])
+      h.store.close()
+    })
+    it.each(['conversation', 'inline', 'review'] as const)('recovers a delayed PR %s using its correct timestamp and endpoint', async kind => {
+      const { h, comment, notified, routes } = delayed('2026-09-09T00:01:37.000Z')
+      notified.subject.url = 'https://api.github.com/repos/acme/widgets/pulls/12'
+      routes['pulls/12'] = openPull(12)
+      routes['issues/12/comments'] = []
+      const path = kind === 'conversation' ? 'issues/comments/5' : kind === 'inline' ? 'pulls/comments/5' : 'pulls/12/reviews/5'
+      const list = kind === 'conversation' ? 'issues/12/comments' : kind === 'inline' ? 'pulls/12/comments' : 'pulls/12/reviews'
+      comment.html_url = `https://github.com/acme/widgets/pull/12#${kind === 'inline' ? 'discussion_r5' : kind === 'review' ? 'pullrequestreview-5' : 'issuecomment-5'}`
+      if (kind === 'review') { comment.submitted_at = commentAt; comment.updated_at = undefined; comment.created_at = undefined }
+      notified.subject.latest_comment_url = `https://api.github.com/repos/acme/widgets/${path}`
+      routes[path] = comment
+      routes[list] = [comment]
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.kind)).toEqual([kind])
+      h.store.close()
+    })
+    it('skips a malformed hint without blocking normal fresh comments', async () => {
+      const { h, comment, routes } = delayed()
+      routes['issues/comments/5'] = { ...comment, updated_at: null, created_at: null }
+      routes['issues/12/comments'] = [{ ...comment, id: 6, updated_at: '2026-09-09T00:00:50Z' }]
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([6])
+      expect(h.health.github).toMatchObject({ state: 'ready', detail: expect.stringContaining('1 unreadable items skipped') })
+      h.store.close()
+    })
+    it('retains resolved boundaries and only retries unresolved hints', async () => {
+      const { h, comment, routes } = delayed('2026-09-09T00:01:37.000Z')
+      h.store.set(KV.github.retries, { 12: { since: '2026-09-09T00:01:37.000Z', pr: false,
+        latestComments: ['issues/comments/5', 'issues/comments/6'] } })
+      routes['issues/comments/6'] = refused(502, 'Bad Gateway')
+      await expect(pollRound(h)).rejects.toThrow('#12')
+      expect(h.store.get(KV.github.retries)?.[12]).toMatchObject({ since: '2026-09-09T00:00:30.000Z', latestComments: ['issues/comments/6'] })
+      routes.notifications = []
+      routes['issues/comments/5'] = refused(502, 'Already resolved')
+      const earlier = { ...comment, id: 6, updated_at: '2026-09-09T00:00:20Z' }
+      routes['issues/comments/6'] = earlier
+      routes['issues/12/comments'] = [earlier, comment]
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([6, 5])
+      h.store.close()
+    })
+    it('preserves an explicitly queued recovery boundary older than the newly introduced baseline', async () => {
+      const { h } = delayed()
+      h.store.set(KV.github.started, watermark)
+      h.store.set(KV.github.retries, { 12: { since: '2026-09-09T00:00:30.000Z', pr: false } })
+      await pollRound(h)
+      expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([5])
+      h.store.close()
+    })
+  })
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {
     const h = host()
     // Opened just before the poll, the Issue is still after the cursor the next poll reads from.

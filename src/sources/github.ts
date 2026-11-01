@@ -19,7 +19,8 @@ import { z } from 'zod'
 export { commentTrigger, type GithubComment } from './github-trigger.ts'
 /** A notification of the agent account; `subject.url` is the API address of its Issue or PR. */
 const NotificationSchema = z.looseObject({
-  repository: z.looseObject({ full_name: z.string() }), subject: z.looseObject({ url: z.string().nullish() }),
+  repository: z.looseObject({ full_name: z.string() }),
+  subject: z.looseObject({ url: z.string().nullish(), latest_comment_url: z.string().nullish() }),
 })
 
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
@@ -152,7 +153,7 @@ interface Round {
 const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), read: new Set(),
   failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
-export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
+export interface Retry { since: string; pr: boolean; openedSince?: string; latestComments?: string[]; failedAt?: string; attempts?: number }
 const RETRY_WINDOW_MS = 24 * 3600_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
@@ -300,6 +301,8 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   const commands = ctx.commands.withSignal(round.signal)
   const since = state.get(KV.github.since) ?? round.started
   if (state.get(KV.github.since) === undefined) state.set(KV.github.since, since)
+  const started = state.get(KV.github.started) ?? since
+  if (state.get(KV.github.started) === undefined) state.set(KV.github.started, started)
   const { repository } = ctx.deployment
   const path = `notifications?all=true&per_page=50&since=${encodeURIComponent(since)}`
   const raw = await commands.api(path, '--include')
@@ -318,9 +321,19 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   for (const notification of notifications.reverse()) {
     if (!sameName(notification.repository.full_name, repository)) continue
     const address = githubAddress(notification.subject.url ?? '', repository)
-    if (!address || address.discussion || items.has(address.number)) continue
+    if (!address || address.discussion) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    const latestComment = notificationCommentPath(notification.subject.latest_comment_url ?? '', repository, number)
+    const pending = items.get(number)
+    if (pending) {
+      if (latestComment && !pending.latestComments?.includes(latestComment)) pending.latestComments = [...pending.latestComments ?? [], latestComment]
+      continue
+    }
+    // Notification arrival and comment creation have different clocks; unrelated polls must not advance a thread's boundary.
+    const contentSince = state.get(KV.github.cursor(number)) ?? since
+    const openedSince = [contentSince, since].sort().at(-1)!
+    items.set(number, { since: contentSince, pr, ...contentSince !== openedSince ? { openedSince } : {},
+      ...latestComment ? { latestComments: [latestComment] } : {} })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
@@ -341,8 +354,44 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   ctx.atomic(() => { state.set(KV.github.since, cursorAt(round.started)); state.set(KV.github.retries, retries) })
   return { count: notifications.length, interval }
 }
+/** Accept only GitHub API comment/review addresses inside this repository; never fetch an arbitrary notification URL. */
+function notificationCommentPath(url: string, repository: string, number: number): string | undefined {
+  const match = /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/((?:issues|pulls)\/comments\/\d+|pulls\/(\d+)\/reviews\/\d+)$/i.exec(url)
+  if (!match || !sameName(match[1]!, repository) || match[3] && Number(match[3]) !== number) return undefined
+  return match[2]
+}
+/** Rewind a thread read to the event a delayed notification names, without importing pre-intake history. */
+async function notificationSince(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<string> {
+  const started = Date.parse(ctx.state.get(KV.github.started) ?? item.since)
+  while (item.latestComments?.length) {
+    const path = item.latestComments[0]!
+    let comment: GithubComment
+    try { comment = await ctx.commands.withSignal(round.signal).api(CommentSchema, path) }
+    catch (error) {
+      // A deleted latest comment must not hide the rest of the conversation; a transient failure must be retried.
+      if (error instanceof CliError && (error.code === 404 || error.code === 410)) { item.latestComments.shift(); continue }
+      throw error
+    }
+    item.latestComments.shift()
+    const addresses = [comment.html_url, comment.issue_url, comment.pull_request_url].filter((url): url is string => typeof url === 'string')
+    if (addresses.some(url => githubAddress(url, ctx.deployment.repository)?.number !== number)) continue
+    const at = Date.parse(comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? '')
+    if (!Number.isFinite(at)) { round.tally.skipped += 1; continue }
+    if (at < started) continue
+    const anchor = Math.max(started, Date.parse(cursorAt(new Date(at).toISOString())))
+    if (anchor < Date.parse(item.since)) {
+      item.openedSince ??= item.since
+      // Retain each resolved boundary even if a later lookup or the conversation read fails.
+      item.since = new Date(anchor).toISOString()
+    }
+  }
+  delete item.latestComments
+  return item.since
+}
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
-  const { since } = item
+  const since = await notificationSince(ctx, round, number, item)
+  const openedSince = item.openedSince ?? item.since
+  if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
   let isPr = item.pr
   if (!isPr) {
     const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
@@ -352,7 +401,7 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
       // An Issue opened by someone other than the agent since the cursor brings its body so a mention in it reaches the gate.
       // A mention added by a later edit to the body is not read: only the author can be the actor of the body.
       const { login } = ctx.deployment.github
-      const opened = Date.parse(issue.created_at) >= Date.parse(since) && !sameName(issue.user.login, login)
+      const opened = Date.parse(issue.created_at) >= Date.parse(openedSince) && !sameName(issue.user.login, login)
       if (opened) await ctx.receive(issueTrigger(issue, login))
       await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round)
       nameThread(ctx, number, issue.title)
@@ -362,7 +411,7 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
     const pr = await pull(ctx, round, number)
     // Emit a PR description trigger for PRs opened since the cursor; its ID is the same as the one produced by the repository PR stream.
     const { login } = ctx.deployment.github
-    if (pr.created_at && Date.parse(pr.created_at) >= Date.parse(since) && !sameName(pr.user.login, login)) {
+    if (pr.created_at && Date.parse(pr.created_at) >= Date.parse(openedSince) && !sameName(pr.user.login, login)) {
       const opened = { number, title: pr.title ?? '', body: pr.body, user: pr.user, created_at: pr.created_at, html_url: pr.html_url }
       await ctx.receive(pullTrigger(opened, login))
     }
